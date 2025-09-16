@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor Working Memory – Delayed Reach (iPad Stylus)</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#fafafa; font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  #ui { padding: 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; background:#fff; border-bottom:1px solid #ddd; position:sticky; top:0; z-index:2;}
+  #status { font-size:14px; }
+  label { font-size:14px; }
+  input, select { padding:6px; }
+  button { padding:8px 12px; border:1px solid #ccc; background:#fff; border-radius:6px; }
+  #canvasWrap { position:relative; width:100%; height:calc(100% - 58px); display:flex; justify-content:center; align-items:center; }
+  #pad { touch-action: none; background:#fff; border:1px solid #ddd; border-radius: 12px; }
+  #overlay { position:absolute; inset:0; display:none; align-items:center; justify-content:center; text-align:left; padding:20px; background:rgba(255,255,255,0.94); font-size:18px; line-height:1.45;}
+  #probeGrid { display:grid; grid-template-columns: repeat(4, 40px); gap:8px; justify-content:center; margin-top:12px;}
+  .sq { width:40px; height:40px; border:1px solid #666; }
+  #motorTapArea { margin-top:12px; display:flex; gap:8px; justify-content:center;}
+  .tapbtn { width:60px; height:60px; border-radius:50%; border:1px solid #444; background:#eee; font-size:18px; }
+  .note { font-size:14px; color:#555; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <label>Participant ID: <input id="pid" placeholder="e.g., S01" style="width:90px;"></label>
+  <button id="startBtn">Start block (toolbar settings)</button>
+  <button id="downloadBtn" disabled>Download CSV</button>
+  <label>Condition mix:
+    <select id="condMix">
+      <option value="all">All (random per trial)</option>
+      <option value="baseline">Baseline only</option>
+      <option value="verbal">Verbal only</option>
+      <option value="vis">Visuospatial only</option>
+      <option value="motor">Motor only</option>
+    </select>
+  </label>
+  <label>Delay (s):
+    <select id="delaySel">
+      <option>3</option><option selected>4</option><option>5</option><option>6</option>
+    </select>
+  </label>
+  <label>Trials per block:
+    <select id="nTrialsSel">
+      <option>10</option><option>16</option><option selected>20</option><option>24</option><option>32</option>
+    </select>
+  </label>
+  <span id="status">Idle</span>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="pad" width="900" height="900"></canvas>
+  <div id="overlay"></div>
+</div>
+
+<script>
+// ====== Config ======
+const R_HOME = 14;
+const R_THRESH = 120;
+const TARGET_RADIUS = 220;
+const TARGET_MS = 400;
+const RETURN_MS = 500;
+const ANGLES = Array.from({length:16}, (_,i)=> i* (360/16));
+
+// ====== State ======
+const canvas = document.getElementById('pad');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const condMixSel = document.getElementById('condMix');
+const delaySel = document.getElementById('delaySel');
+const nTrialsSel = document.getElementById('nTrialsSel');
+const pidEl = document.getElementById('pid');
+
+const W = canvas.width, H = canvas.height;
+const CX = W/2, CY = H/2;
+
+let trials = [];
+let trialN = 0;
+let running = false;
+let condition = 'baseline';
+let blockPlan = [];
+let delaySec = 4;
+let trialsPerBlock = Number(nTrialsSel ? nTrialsSel.value : 20);
+
+let phase = 'idle';
+let current = null;
+let path = [];
+let pointerDown = false;
+
+// ====== Utilities ======
+function deg2rad(d){ return d*Math.PI/180; }
+function rad2deg(r){ return r*180/Math.PI; }
+function wrapDeg(a){ while(a>180) a-=360; while(a<=-180) a+=360; return a; }
+function polarAt(angleDeg, r){ return [CX + r*Math.cos(deg2rad(angleDeg)), CY + r*Math.sin(deg2rad(angleDeg))]; }
+function randChoice(a){ return a[Math.floor(Math.random()*a.length)]; }
+function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]] } return a; }
+function now(){ return performance.now(); }
+function sleep(ms){ return new Promise(r=> setTimeout(r, ms)); }
+
+// ====== Drawing ======
+function drawBase(){
+  ctx.clearRect(0,0,W,H);
+  ctx.beginPath();
+  ctx.arc(CX, CY, R_HOME, 0, 2*Math.PI);
+  ctx.fillStyle = '#222'; ctx.fill();
+  ctx.beginPath();
+  ctx.arc(CX, CY, R_THRESH, 0, 2*Math.PI);
+  ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth=1; ctx.stroke();
+}
+
+function drawTarget(angleDeg){
+  const [tx,ty] = polarAt(angleDeg, TARGET_RADIUS);
+  ctx.beginPath();
+  ctx.arc(tx, ty, 10, 0, 2*Math.PI);
+  ctx.fillStyle = '#2a7'; ctx.fill();
+}
+
+function drawPath(samples){
+  if(samples.length<2) return;
+  ctx.beginPath();
+  ctx.moveTo(samples[0].x, samples[0].y);
+  for(let i=1;i<samples.length;i++){
+    ctx.lineTo(samples[i].x, samples[i].y);
+  }
+  ctx.strokeStyle = '#06f';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+// ====== Conditions ======
+const CONDS_ALL = ['baseline','verbal','vis','motor'];
+
+function makeBlockPlan(mix, n, fixedCond=null){
+  if (fixedCond) return Array(n).fill(fixedCond);
+  let pool = [];
+  if(mix==='all') pool = CONDS_ALL;
+  else if(mix==='baseline') pool=['baseline'];
+  else if(mix==='verbal') pool=['verbal'];
+  else if(mix==='vis') pool=['vis'];
+  else if(mix==='motor') pool=['motor'];
+  let arr = [];
+  for(let i=0;i<n;i++){ arr.push(randChoice(pool)); }
+  return arr;
+}
+
+// ====== Visuospatial load ======
+let visArray = null; let visProbe = null;
+
+function makeVisArray(){
+  let coords = [];
+  for(let r=0;r<4;r++) for(let c=0;c<4;c++) coords.push([r,c]);
+  coords = shuffle(coords).slice(0,5);
+  const colors = ['#f33','#36f','#0a0','#fa0','#a0f','#0aa','#aaa','#333'];
+  visArray = coords.map(([r,c])=> ({r,c,color: randChoice(colors)}));
+  const change = Math.random()<0.5;
+  const idx = Math.floor(Math.random()*visArray.length);
+  visProbe = JSON.parse(JSON.stringify(visArray));
+  if(change){
+    let col = visProbe[idx].color;
+    let newCol = col; while(newCol===col) newCol = randChoice(colors);
+    visProbe[idx].color = newCol;
+  }
+  visProbe.change = change;
+}
+
+function showVisArray(ms){
+  overlay.style.display='flex';
+  overlay.innerHTML = `<div style="text-align:center;">
+    <div>Remember this pattern</div>
+    <div id="probeGrid"></div>
+  </div>`;
+  const grid = overlay.querySelector('#probeGrid');
+  grid.innerHTML='';
+  visArray.forEach(o=>{
+    const cell=document.createElement('div'); cell.className='sq';
+    cell.style.background=o.color;
+    grid.appendChild(cell);
+  });
+  setTimeout(()=>{ overlay.style.display='none'; }, ms);
+}
+
+function visProbeQuery(){
+  overlay.style.display='flex';
+  overlay.innerHTML = `<div style="text-align:center;">
+    <div>Was the pattern the SAME or DIFFERENT?</div>
+    <div id="probeGrid" style="margin-bottom:10px;"></div>
+    <div style="display:flex; gap:10px; justify-content:center;">
+      <button id="sameBtn">Same</button>
+      <button id="diffBtn">Different</button>
+    </div>
+  </div>`;
+  const grid = overlay.querySelector('#probeGrid');
+  grid.innerHTML='';
+  visProbe.forEach(o=>{
+    const cell=document.createElement('div'); cell.className='sq';
+    cell.style.background=o.color;
+    grid.appendChild(cell);
+  });
+  return new Promise(resolve=>{
+    overlay.querySelector('#sameBtn').onclick = ()=>{ overlay.style.display='none'; resolve('same'); }
+    overlay.querySelector('#diffBtn').onclick = ()=>{ overlay.style.display='none'; resolve('different'); }
+  });
+}
+
+// ====== Motor tapping load ======
+let requiredTaps = null;
+let tapsSoFar = [];
+
+function makeTapPattern(){
+  const len = 4;
+  requiredTaps = Array.from({length:len}, ()=> 1+Math.floor(Math.random()*3));
+  tapsSoFar = [];
+}
+function showTapUI(){
+  overlay.style.display='flex';
+  overlay.innerHTML = `<div style="text-align:center;">
+    <div>Please tap this pattern during the delay (use finger of your other hand):</div>
+    <div style="margin-top:8px; font-size:18px">${requiredTaps.join(' - ')}</div>
+    <div id="motorTapArea">
+      <button class="tapbtn" data-k="1">1</button>
+      <button class="tapbtn" data-k="2">2</button>
+      <button class="tapbtn" data-k="3">3</button>
+    </div>
+    <div id="tapStatus" style="margin-top:8px; font-size:16px;">Progress: 0 / ${requiredTaps.length}</div>
+  </div>`;
+  overlay.querySelectorAll('.tapbtn').forEach(btn=>{
+    btn.onclick = ()=>{
+      const k = Number(btn.dataset.k);
+      tapsSoFar.push(k);
+      const p = overlay.querySelector('#tapStatus');
+      p.textContent = `Progress: ${tapsSoFar.length} / ${requiredTaps.length}`;
+    }
+  });
+}
+function hideOverlay(){ overlay.style.display='none'; }
+
+// ====== Trial control ======
+async function runTrial(){
+  phase = 'fix';
+  path = [];
+  drawBase();
+  statusEl.textContent = `Trial ${trialN+1}/${blockPlan.length} – place stylus in the centre circle`;
+
+  const angle = randChoice(ANGLES);
+  condition = blockPlan[trialN];
+
+  current = {
+    participant: (pidEl.value||''),
+    trial: trialN+1,
+    condition,
+    target_deg: angle,
+    delay_s: delaySec,
+    encode_time:null, recall_time:null,
+    encode_angle_deg:null, recall_angle_deg:null,
+    error_deg:null,
+    visAcc:null,
+    motorTapsMatch:null
+  };
+
+  // ENCODE
+  await sleep(400);
+  drawBase();
+  drawTarget(angle);
+  await sleep(TARGET_MS);
+  drawBase();
+  statusEl.textContent = `Trial ${current.trial}: quick flick TOWARD the (vanished) target, then back to centre`;
+  phase = 'encode';
+  const encodeDeadline = now() + 3000;
+  await waitForStroke('encode', encodeDeadline);
+  statusEl.textContent = `Return to centre…`;
+  await sleep(RETURN_MS);
+
+  // DELAY
+  phase = 'delay';
+  if(condition==='verbal'){
+    overlay.style.display='flex';
+    overlay.innerHTML = `<div>Please repeat softly: “the… the… the…” until the screen changes.</div>`;
+  } else if(condition==='vis'){
+    makeVisArray();
+    showVisArray(1200);
+    await sleep(1200);
+  } else if(condition==='motor'){
+    makeTapPattern();
+    showTapUI();
+  }
+  statusEl.textContent = `Hold in memory – delay ${delaySec}s`;
+  await sleep(delaySec*1000);
+  if(condition==='verbal') hideOverlay();
+  if(condition==='motor'){
+    hideOverlay();
+    const ok = requiredTaps.length===tapsSoFar.length && requiredTaps.every((v,i)=> v===tapsSoFar[i]);
+    current.motorTapsMatch = ok ? 1 : 0;
+  }
+
+  // RECALL
+  phase = 'recall';
+  drawBase();
+  statusEl.textContent = `RECALL: reproduce the SAME direction (quick flick)`;
+  const recallDeadline = now() + 5000;
+  await waitForStroke('recall', recallDeadline);
+
+  if(condition==='vis'){
+    const ans = await visProbeQuery();
+    const corr = (ans==='same' && !visProbe.change) || (ans==='different' && visProbe.change);
+    current.visAcc = corr ? 1 : 0;
+  }
+
+  current.error_deg = (current.recall_angle_deg==null) ? null :
+    wrapDeg(current.recall_angle_deg - current.target_deg);
+
+  trials.push(current);
+  trialN++;
+}
+
+function waitForStroke(which, deadline){
+  return new Promise(resolve=>{
+    const tick = ()=>{
+      if(now()>deadline) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    const chk = setInterval(()=>{
+      if(which==='encode' && current.encode_angle_deg!=null){ clearInterval(chk); resolve(); }
+      if(which==='recall' && current.recall_angle_deg!=null){ clearInterval(chk); resolve(); }
+    }, 50);
+  });
+}
+
+// ====== Pointer events ======
+canvas.addEventListener('pointerdown', e=>{
+  if(phase==='encode' || phase==='recall'){
+    pointerDown = true;
+    path = [];
+    recordSample(e);
+    drawBase(); drawPath(path);
+  }
+}, {passive:false});
+canvas.addEventListener('pointermove', e=>{
+  if(pointerDown && (phase==='encode' || phase==='recall')){
+    recordSample(e);
+    drawBase(); drawPath(path);
+    const {x,y} = path[path.length-1];
+    const dx = x - CX, dy = y - CY;
+    const r = Math.hypot(dx,dy);
+    if(r>=R_THRESH){
+      const ang = wrapDeg(rad2deg(Math.atan2(dy,dx)));
+      if(phase==='encode' && current.encode_angle_deg==null){
+        current.encode_angle_deg = ang;
+        current.encode_time = Date.now();
+      }
+      if(phase==='recall' && current.recall_angle_deg==null){
+        current.recall_angle_deg = ang;
+        current.recall_time = Date.now();
+      }
+    }
+  }
+}, {passive:false});
+canvas.addEventListener('pointerup', e=>{
+  if(pointerDown){
+    pointerDown=false;
+    recordSample(e);
+    drawBase(); drawPath(path);
+  }
+}, {passive:false});
+
+function recordSample(e){
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width/rect.width);
+  const y = (e.clientY - rect.top)  * (canvas.height/rect.height);
+  path.push({x,y,t:performance.now(), type:e.pointerType});
+}
+
+// ====== Block + Session control ======
+async function runBlock(nTrials = Number(nTrialsSel.value), label = 'Block', fixedCond=null){
+  running = true;
+  trialN = 0;
+  trials = [];
+  delaySec = Number(delaySel.value);
+  const n = nTrials;
+  blockPlan = makeBlockPlan(condMixSel.value, n, fixedCond);
+
+  startBtn.disabled = true; downloadBtn.disabled = true;
+
+  for (let i = 0; i < n; i++) {
+    await runTrial();
+    drawBase();
+    statusEl.textContent = `Done ${label.toLowerCase()} trial ${i+1}/${n}`;
+    await sleep(400);
+  }
+
+  running = false;
+  startBtn.disabled = false;
+  downloadBtn.disabled = false;
+  statusEl.textContent = `${label} complete. You can download CSV.`;
+
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `
+    <div style="max-width:560px; text-align:center;">
+      <h2>${label} complete</h2>
+      <p>You can now download your data as a CSV file.</p>
+      <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:10px;">
+        <button id="endDownloadBtn">Download CSV</button>
+        <button id="againBtn">Repeat this ${label.toLowerCase()}</button>
+        <button id="homeBtn">Back to instructions</button>
+      </div>
+      <p class="note">Participant: ${pidEl.value||'(none)'} • Condition: ${fixedCond?fixedCond:condMixSel.value} • Trials: ${n} • Delay: ${delaySec}s</p>
+    </div>`;
+  document.getElementById('endDownloadBtn').onclick = ()=> downloadCSV();
+  document.getElementById('againBtn').onclick = ()=>{
+    overlay.style.display='none';
+    runBlock(n, label, fixedCond);
+  };
+  document.getElementById('homeBtn').onclick = ()=>{
+    overlay.style.display='none';
+    showIntro();
+  };
+}
+
+async function runSessionBlocked(order = ['baseline','verbal','vis','motor'], nTrials = null){
+  const n = nTrials ?? Number(nTrialsSel.value);
+  for (let i=0; i<order.length; i++){
+    const cond = order[i];
+    overlay.style.display='flex';
+    overlay.innerHTML = `
+      <div style="max-width:680px;">
+        <h2>Next block: ${cond.toUpperCase()}</h2>
+        <p>During the delay you will ${
+          cond==='baseline' ? 'do nothing extra.' :
+          cond==='verbal'   ? 'softly repeat “the… the… the…”' :
+          cond==='vis'      ? 'remember a small coloured pattern' :
+                              'tap a short on-screen pattern with your other hand'
+        }</p>
+        <p>Each trial: flick the stylus toward the brief target, wait, then reproduce the <b>same direction</b> (no target shown).</p>
+        <button id="goBlock">Start ${cond} block (${n} trials)</button>
+      </div>`;
+    await new Promise(res=> overlay.querySelector('#goBlock').onclick = ()=>{ overlay.style.display='none'; res(); });
+
+    await runBlock(n, `Block: ${cond}`, cond);
+  }
+  overlay.style.display='flex';
+  overlay.innerHTML = `
+    <div style="max-width:560px; text-align:center;">
+      <h2>Session complete</h2>
+      <p>You’ve finished all blocks. Download your data before exiting.</p>
+      <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:10px;">
+        <button id="endDownloadBtn2">Download CSV</button>
+        <button id="homeBtn2">Back to instructions</button>
+      </div>
+      <p class="note">Participant: ${pidEl.value||'(none)'}</p>
+    </div>`;
+  document.getElementById('endDownloadBtn2').onclick = ()=> downloadCSV();
+  document.getElementById('homeBtn2').onclick = ()=>{ overlay.style.display='none'; showIntro(); };
+}
+
+// ====== CSV ======
+function toCSV(){
+  const fields = [
+    'participant','trial','condition','target_deg','delay_s',
+    'encode_angle_deg','recall_angle_deg','error_deg',
+    'visAcc','motorTapsMatch','encode_time','recall_time'
+  ];
+  let rows = [fields.join(',')];
+  for(const r of trials){
+    rows.push(fields.map(k=> (r[k]==null?'':r[k])).join(','));
+  }
+  return rows.join('\\n');
+}
+
+function downloadCSV(){
+  const blob = new Blob([toCSV()], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const id = pidEl.value ? `_PID-${pidEl.value}` : '';
+  a.href = url; a.download = `mwm_reach${id}_${Date.now()}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ====== Intro & Toolbar ======
+function showIntro(){
+  overlay.style.display='flex';
+  overlay.innerHTML = `
+    <div style="max-width:700px;">
+      <h2>Motor Working Memory – Delayed Reach</h2>
+      <ol>
+        <li>Keep the stylus in the centre circle.</li>
+        <li>A target dot briefly appears—make a quick flick <b>toward</b> it and return to centre.</li>
+        <li>During the delay, depending on the block: none / verbal / visuospatial / motor tapping.</li>
+        <li>Reproduce the <b>same direction</b> without the target when prompted.</li>
+      </ol>
+      <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="startDemoBtn">Quick demo (5 random trials)</button>
+        <button id="startBlockBtn">Single block (use toolbar settings)</button>
+        <button id="startSessionBtn">Blocked session (Baseline → Verbal → Vis → Motor)</button>
+      </div>
+      <p class="note" style="margin-top:10px;">Tip: use Apple Pencil if available; hold the iPad steady.</p>
+    </div>`;
+  document.getElementById('startDemoBtn').onclick   = ()=>{ overlay.style.display='none'; runBlock(5, 'Demo'); };
+  document.getElementById('startBlockBtn').onclick  = ()=>{ overlay.style.display='none'; runBlock(Number(nTrialsSel.value), 'Block'); };
+  document.getElementById('startSessionBtn').onclick= ()=>{
+    overlay.style.display='none';
+    runSessionBlocked(['baseline','verbal','vis','motor'], Number(nTrialsSel.value));
+  };
+}
+
+startBtn.onclick = ()=> { if(!running) runBlock(Number(nTrialsSel.value), 'Block'); };
+downloadBtn.onclick = downloadCSV;
+
+// Init
+drawBase();
+statusEl.textContent = 'Idle – open the instructions overlay to begin';
+showIntro();
+</script>
+</body>
+</html>
