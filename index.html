@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>MWM Demo – 5 Trials (iPad Stylus)</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#fafafa;
+               font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  #ui { padding: 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+        background:#fff; border-bottom:1px solid #ddd; position:sticky; top:0; z-index:2; }
+  #canvasWrap { position:relative; width:100%; height:calc(100% - 58px); display:flex; justify-content:center; align-items:center; }
+  #pad { touch-action: none; background:#fff; border:1px solid #ddd; border-radius: 12px; }
+  #overlay { position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+             text-align:left; padding:24px; background:rgba(255,255,255,0.96); font-size:18px; line-height:1.45; }
+  .btn { padding:10px 14px; border:1px solid #ccc; background:#fff; border-radius:8px; font-size:16px; }
+  .note { font-size:14px; color:#555; }
+  /* iOS: suppress selection/zoom/tap highlight */
+  * { -webkit-tap-highlight-color: rgba(0,0,0,0); }
+  html, body, #canvasWrap, #overlay, #pad, button, label, select, input {
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  ::selection { background: transparent; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <label>Participant ID: <input id="pid" placeholder="e.g., S01" style="width:90px;"></label>
+  <button id="startDemo" class="btn">Start 5‑trial demo</button>
+  <button id="downloadBtn" class="btn" disabled>Download CSV</button>
+  <span id="status" style="margin-left:8px; font-size:14px;"></span>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="pad" width="900" height="900"></canvas>
+  <div id="overlay"></div>
+</div>
+
+<script>
+// Prevent selection/zoom artefacts
+['selectstart','gesturestart','dblclick'].forEach(ev => {
+  document.addEventListener(ev, e => e.preventDefault(), {passive:false});
+});
+let lastTouchEnd = 0;
+document.addEventListener('touchend', function (e) {
+  const now = Date.now();
+  if (now - lastTouchEnd <= 300) { e.preventDefault(); }
+  lastTouchEnd = now;
+}, {passive:false});
+document.addEventListener('touchmove', function(e){
+  if (e.scale && e.scale !== 1) e.preventDefault();
+}, {passive:false});
+
+// ====== Config (demo) ======
+const N_TRIALS = 5;
+const FIX_MS = 3000;         // fixation duration
+const TARGET_MS = 500;       // black cross flash
+const DELAY_MS = 10000;      // 10s delay
+const R_HOME = 18;
+const HOME_SNAP = 26;        // touch tolerance for centre
+const R_THRESH = 120;        // radius where we sample angle
+const TARGET_RADIUS = 220;   // target distance from centre
+const ANGLES = Array.from({length:16}, (_,i)=> i*(360/16));
+const ERROR_OK_DEG = 7;      // encode error tolerance
+const START_IN_HOME_MS = 200; // require 200ms centre contact before accepting encode
+// Drawing aids
+const SHOW_DASHED_THRESHOLD = true;
+
+// ====== Elements ======
+const canvas = document.getElementById('pad');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const pidEl = document.getElementById('pid');
+const startBtn = document.getElementById('startDemo');
+const downloadBtn = document.getElementById('downloadBtn');
+const statusEl = document.getElementById('status');
+
+const W = canvas.width, H = canvas.height;
+const CX = W/2, CY = H/2;
+
+// ====== State ======
+let trials = [];
+let contact = false;
+let inHomeContact = false;
+let lastXY = {x:CX, y:CY};
+let inHomeSince = null; // timestamp when contact entered home
+
+const sleep = ms => new Promise(r=> setTimeout(r, ms));
+const deg2rad = d => d*Math.PI/180;
+const rad2deg = r => r*180/Math.PI;
+const wrapDeg = a => { while(a>180) a-=360; while(a<=-180) a+=360; return a; };
+const polarAt = (ang, r) => [CX + r*Math.cos(deg2rad(ang)), CY + r*Math.sin(deg2rad(ang))];
+
+function isContact(e){ return (e.pressure && e.pressure>0) || (e.buttons && e.buttons===1); }
+function getCanvasXY(e){
+  const rect = canvas.getBoundingClientRect();
+  return { x:(e.clientX-rect.left)*(canvas.width/rect.width),
+           y:(e.clientY-rect.top)*(canvas.height/rect.height) };
+}
+
+// ====== Drawing ======
+function drawBase(){
+  ctx.clearRect(0,0,W,H);
+
+  // OUTLINE ONLY ring (no fill)
+  ctx.beginPath();
+  ctx.arc(CX, CY, TARGET_RADIUS, 0, 2*Math.PI);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#cfcfcf';
+  ctx.stroke();
+
+  // Optional dashed measurement threshold (same as ring to keep simple)
+  if(SHOW_DASHED_THRESHOLD){
+    ctx.setLineDash([6,6]);
+    ctx.beginPath();
+    ctx.arc(CX, CY, R_THRESH, 0, 2*Math.PI);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // centre home circle (green only on contact in centre)
+  ctx.beginPath();
+  ctx.arc(CX, CY, R_HOME, 0, 2*Math.PI);
+  ctx.fillStyle = inHomeContact ? '#2ecc71' : '#111';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = inHomeContact ? '#1e8f4e' : '#444';
+  ctx.stroke();
+}
+
+function drawTargetCross(angleDeg){
+  const [tx,ty] = polarAt(angleDeg, TARGET_RADIUS); // ON the outline
+  const L = 16; // half-length of cross arms
+  ctx.save();
+  ctx.translate(tx,ty);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(-L,0); ctx.lineTo(L,0);
+  ctx.moveTo(0,-L); ctx.lineTo(0,L);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function flashTarget(angleDeg, ms){
+  drawBase();
+  drawTargetCross(angleDeg);
+  setTimeout(()=>{ drawBase(); }, ms);
+}
+
+function drawAngleVector(angleDeg, color, r=TARGET_RADIUS){
+  const [tx,ty] = polarAt(angleDeg, r);
+  ctx.beginPath();
+  ctx.moveTo(CX, CY);
+  ctx.lineTo(tx, ty);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
+// ====== Flow helpers ======
+function updateContactState(e){
+  contact = isContact(e);
+  const {x,y} = getCanvasXY(e);
+  lastXY = {x,y};
+  const r = Math.hypot(x-CX, y-CY);
+  const now = performance.now();
+  const wasInHome = inHomeContact;
+  inHomeContact = contact && (r <= HOME_SNAP);
+  if(inHomeContact){
+    if(!wasInHome){ inHomeSince = now; } // started a new centre contact
+  } else {
+    inHomeSince = null; // reset
+  }
+  drawBase();
+}
+
+// Requires: (a) 200ms centre contact to begin; (b) capture angle when crossing threshold;
+// (c) require return to centre; (d) require lift
+async function waitForStrokeAndReturn(which, current){
+  return new Promise(resolve=>{
+    let startedFromCentre = false;
+    let angleCaptured = false;
+    let returnedAfterAngle = false;
+    let lifted = false;
+
+    const poll = setInterval(()=>{
+      const t = performance.now();
+      if(!startedFromCentre && inHomeSince && (t - inHomeSince >= START_IN_HOME_MS)){
+        startedFromCentre = true;
+      }
+      if(which==='encode' && current.encode_angle_deg!=null) angleCaptured = true;
+      if(which==='recall' && current.recall_angle_deg!=null) angleCaptured = true;
+      if(angleCaptured && inHomeContact) returnedAfterAngle = true;
+      if(startedFromCentre && angleCaptured && returnedAfterAngle && lifted){
+        clearInterval(poll); resolve();
+      }
+    }, 16);
+
+    const onMove = (e)=>{
+      updateContactState(e);
+      if(!contact || !startedFromCentre) return;
+      const {x,y} = lastXY;
+      const r = Math.hypot(x-CX, y-CY);
+      if(r>=R_THRESH){
+        const ang = wrapDeg(rad2deg(Math.atan2(y-CY, x-CX)));
+        if(which==='encode' && current.encode_angle_deg==null){
+          current.encode_angle_deg = ang;
+          current.encode_time = Date.now();
+        }
+        if(which==='recall' && current.recall_angle_deg==null){
+          current.recall_angle_deg = ang;
+          current.recall_time = Date.now();
+        }
+      }
+    };
+    const onUp = (e)=>{
+      updateContactState(e);
+      lifted = true;
+    };
+    canvas.addEventListener('pointermove', onMove, {passive:false});
+    canvas.addEventListener('pointerup', onUp, {passive:false});
+
+    // safety cleanup
+    setTimeout(()=>{
+      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onUp);
+      clearInterval(poll);
+      resolve();
+    }, 25000);
+  });
+}
+
+// ====== Trial ======
+async function runTrial(i){
+  const target_deg = ANGLES[Math.floor(Math.random()*ANGLES.length)];
+
+  const current = {
+    participant: (pidEl.value||''),
+    trial: i+1, target_deg,
+    encode_angle_deg:null, recall_angle_deg:null,
+    encode_error_deg:null, recall_error_deg:null,
+    encode_time:null, recall_time:null
+  };
+
+  // ENCODE with repeat if >7°
+  let ok = false;
+  while(!ok){
+    drawBase();
+    statusEl.textContent = `Trial ${i+1}/${N_TRIALS}: focus centre…`;
+    await sleep(FIX_MS);
+    flashTarget(target_deg, TARGET_MS);
+    statusEl.textContent = `Flick toward where the cross was, then RETURN and lift`;
+    await waitForStrokeAndReturn('encode', current);
+
+    // Compute encode error
+    if(current.encode_angle_deg!=null){
+      current.encode_error_deg = wrapDeg(current.encode_angle_deg - target_deg);
+      const absErr = Math.abs(current.encode_error_deg);
+
+      // Visual feedback overlay: show vectors & numeric error
+      overlay.style.display='flex';
+      overlay.innerHTML = `<div style="max-width:620px; text-align:center;">
+        <h2>Initial movement</h2>
+        <p>Error = <b>${absErr.toFixed(1)}°</b> (tolerance ±${ERROR_OK_DEG}°)</p>
+        <canvas id="fb" width="400" height="400" style="border:1px solid #ddd; border-radius:8px;"></canvas><br>
+        <button class="btn" id="fbBtn">${absErr <= ERROR_OK_DEG ? 'Continue' : 'Try again'}</button>
+      </div>`;
+
+      // Draw feedback
+      const fb = document.getElementById('fb');
+      const fx = fb.getContext('2d');
+      const FX = fb.width/2, FY = fb.height/2, RR = 140;
+      fx.clearRect(0,0,fb.width,fb.height);
+      // ring
+      fx.beginPath(); fx.arc(FX, FY, RR, 0, 2*Math.PI); fx.strokeStyle='#cfcfcf'; fx.lineWidth=3; fx.stroke();
+      // threshold
+      fx.setLineDash([6,6]); fx.beginPath(); fx.arc(FX, FY, RR*R_THRESH/TARGET_RADIUS, 0, 2*Math.PI);
+      fx.lineWidth=1.5; fx.strokeStyle='rgba(0,0,0,0.18)'; fx.stroke(); fx.setLineDash([]);
+      // vectors
+      const toXY = (ang, r)=> [FX + r*Math.cos(deg2rad(ang)), FY + r*Math.sin(deg2rad(ang))];
+      fx.beginPath(); fx.moveTo(FX,FY);
+      let [tx,ty] = toXY(target_deg, RR); fx.lineTo(tx,ty);
+      fx.lineWidth=4; fx.strokeStyle='#000'; fx.stroke(); // target = black
+      fx.beginPath(); fx.moveTo(FX,FY);
+      [tx,ty] = toXY(current.encode_angle_deg, RR);
+      fx.lineTo(tx,ty); fx.lineWidth=4; fx.strokeStyle= absErr<=ERROR_OK_DEG ? '#2ecc71' : '#d81b60'; fx.stroke();
+
+      await new Promise(res=> overlay.querySelector('#fbBtn').onclick=()=>{ overlay.style.display='none'; res(); });
+      ok = absErr <= ERROR_OK_DEG;
+      if(!ok){
+        // reset encode for another attempt
+        current.encode_angle_deg = null;
+        current.encode_time = null;
+      }
+    } else {
+      overlay.style.display='flex';
+      overlay.innerHTML = `<div style="max-width:560px; text-align:center;">
+        <h2>No movement captured</h2>
+        <p>Start from the centre (green when touching), flick past the dashed ring, return to centre, then lift.</p>
+        <button class="btn" id="repeatBtn2">Repeat trial</button>
+      </div>`;
+      await new Promise(res=> overlay.querySelector('#repeatBtn2').onclick = ()=>{ overlay.style.display='none'; res(); });
+    }
+  }
+
+  // DELAY + RECALL
+  statusEl.textContent = `Hold in memory…`;
+  await sleep(DELAY_MS);
+  drawBase();
+  statusEl.textContent = `RECALL: reproduce direction, then RETURN and lift`;
+  await waitForStrokeAndReturn('recall', current);
+  if(current.recall_angle_deg!=null){
+    current.recall_error_deg = wrapDeg(current.recall_angle_deg - target_deg);
+  }
+
+  trials.push(current);
+}
+
+// ====== Demo runner ======
+async function runDemo(){
+  startBtn.disabled = true; downloadBtn.disabled = true; pidEl.disabled = true; pidEl.blur();
+  trials = [];
+  for(let i=0;i<N_TRIALS;i++){ await runTrial(i); }
+  startBtn.disabled = false; downloadBtn.disabled = false; pidEl.disabled = false;
+
+  overlay.style.display='flex';
+  overlay.innerHTML = `<div style="max-width:560px; text-align:center;">
+    <h2>Demo complete</h2>
+    <p>You can now download the CSV data.</p>
+    <button class="btn" id="dlBtn">Download CSV</button>
+    <button class="btn" id="againBtn">Run again</button>
+  </div>`;
+  document.getElementById('dlBtn').onclick = downloadCSV;
+  document.getElementById('againBtn').onclick = ()=>{ overlay.style.display='none'; runDemo(); };
+}
+
+// ====== CSV ======
+function toCSV(){
+  const fields = [
+    'participant','trial','target_deg',
+    'encode_angle_deg','encode_error_deg','encode_time',
+    'recall_angle_deg','recall_error_deg','recall_time'
+  ];
+  let rows = [fields.join(',')];
+  for(let i=0;i<trials.length;i++){
+    const r = trials[i];
+    rows.push(fields.map(k=> (r[k]==null?'':r[k])).join(','));
+  }
+  return rows.join('\\n');
+}
+function downloadCSV(){
+  const blob = new Blob([toCSV()], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const id = pidEl.value ? `_PID-${pidEl.value}` : '';
+  a.href = url; a.download = `mwm_demo5${id}_${Date.now()}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ====== Pointer handling ======
+canvas.addEventListener('pointerdown', e=>{ updateContactState(e); }, {passive:false});
+canvas.addEventListener('pointermove', e=>{ updateContactState(e); }, {passive:false});
+canvas.addEventListener('pointerup', e=>{ updateContactState(e); }, {passive:false});
+
+// ====== Intro overlay ======
+function showIntro(){
+  overlay.style.display='flex';
+  overlay.innerHTML = `<div style="max-width:720px;">
+    <h2>5‑Trial Demo</h2>
+    <ol>
+      <li>A thin <b>grey outline</b> circle and a small <b>black</b> centre dot appear — look at the centre.</li>
+      <li>After <b>3 s</b>, a <b>black cross</b> briefly appears <b>on the grey outline</b>.</li>
+      <li>Touch the centre (the dot turns <b>green</b>), then make a quick <b>flick toward where the cross was</b> and return to the centre; then lift.</li>
+      <li>If your initial flick is more than <b>±7°</b> off, you’ll repeat that trial (you’ll see a visual comparison).</li>
+      <li>After <b>10 s</b>, reproduce the <b>same direction</b> without a target, then return and lift.</li>
+    </ol>
+    <button class="btn" id="goBtn">Start 5‑trial demo</button>
+    <p class="note">Tip: the dashed inner ring is where your direction is measured.</p>
+  </div>`;
+  document.getElementById('goBtn').onclick = ()=>{ overlay.style.display='none'; runDemo(); };
+}
+startBtn.onclick = ()=>{ overlay.style.display='none'; runDemo(); };
+downloadBtn.onclick = downloadCSV;
+
+// ====== Init ======
+drawBase();
+showIntro();
+</script>
+</body>
+</html>
